@@ -1,0 +1,9 @@
+# Supabase (must be EU region for GDPR)
+NEXT_PUBLIC_SUPABASE_URL=https://xxx.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...
+
+# API Gateway (your NestJS backend)
+NEXT_PUBLIC_API_URL=http://localhost:4000/api/v1
+
+# Scraper platform (for regulation feed page)
+NEXT_PUBLIC_SCRAPER_URL=https://compliance-scraper.railway.app

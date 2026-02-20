@@ -1,0 +1,226 @@
+-- ============================================================
+-- ASSURE CODE — Spec System Migration (003)
+-- Run after 001_pgvector.sql and 002_gateway_tables.sql
+-- ============================================================
+
+-- ── Workspace Members ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS workspace_members (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id  UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id       UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  email         TEXT NOT NULL,
+  role          TEXT NOT NULL DEFAULT 'developer'
+                  CHECK (role IN ('owner', 'compliance_officer', 'developer')),
+  github_login  TEXT,              -- For PR assignment
+  invited_by    UUID REFERENCES auth.users(id),
+  joined_at     TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (workspace_id, user_id)   -- One role per user per workspace
+);
+
+CREATE INDEX workspace_members_workspace_idx ON workspace_members (workspace_id);
+CREATE INDEX workspace_members_user_idx ON workspace_members (user_id);
+
+ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "members_workspace_isolation" ON workspace_members
+  FOR ALL USING (
+    workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
+      UNION
+      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+    )
+  );
+
+-- ── Spec Versions (the versioned container) ────────────────────
+-- Each row is one complete snapshot of all 5 modules.
+-- parent_id forms the version chain.
+CREATE TABLE IF NOT EXISTS spec_versions (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id        UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  parent_id           UUID REFERENCES spec_versions(id), -- null = v1
+  version_number      INTEGER NOT NULL DEFAULT 1,
+  version_label       TEXT NOT NULL DEFAULT 'v1.0.0',
+  status              TEXT NOT NULL DEFAULT 'draft'
+                        CHECK (status IN ('draft', 'active', 'superseded', 'archived')),
+  change_reason       TEXT NOT NULL DEFAULT 'Initial creation',
+  triggered_by        TEXT NOT NULL DEFAULT 'user'
+                        CHECK (triggered_by IN ('user', 'regulation_update', 'scan')),
+  regulation_trigger  TEXT,         -- e.g. "GDPR Article 17"
+  jurisdictions       TEXT[] NOT NULL,
+  frameworks          TEXT[] NOT NULL,
+
+  -- The 5 modules stored as JSONB columns for independent querying
+  master_specification      JSONB,
+  security_blueprint        JSONB,
+  cost_analysis             JSONB,
+  tech_stack_justification  JSONB,
+  code_scaffolding          JSONB,
+
+  -- Metadata
+  created_by          UUID REFERENCES auth.users(id),
+  scan_score          FLOAT,
+  github_pr_url       TEXT,
+  created_at          TIMESTAMPTZ DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX spec_versions_workspace_idx
+  ON spec_versions (workspace_id, version_number DESC);
+CREATE INDEX spec_versions_parent_idx
+  ON spec_versions (parent_id);
+CREATE INDEX spec_versions_status_idx
+  ON spec_versions (workspace_id, status)
+  WHERE status = 'active';
+CREATE INDEX spec_versions_trigger_idx
+  ON spec_versions (regulation_trigger)
+  WHERE regulation_trigger IS NOT NULL;
+
+-- JSONB indexes for searching within modules
+CREATE INDEX spec_master_gin ON spec_versions USING GIN (master_specification);
+CREATE INDEX spec_security_gin ON spec_versions USING GIN (security_blueprint);
+
+ALTER TABLE spec_versions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "specs_workspace_isolation" ON spec_versions
+  FOR ALL USING (
+    workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
+      UNION
+      SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()
+    )
+  );
+
+-- ── Clause Diffs (audit trail for every patch) ─────────────────
+CREATE TABLE IF NOT EXISTS spec_diffs (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  from_version_id     UUID NOT NULL REFERENCES spec_versions(id),
+  to_version_id       UUID NOT NULL REFERENCES spec_versions(id),
+  module              TEXT NOT NULL,
+  clause_path         TEXT NOT NULL,    -- e.g. "encryptionControls[2].algorithm"
+  field_label         TEXT NOT NULL,
+  before_value        TEXT NOT NULL,
+  after_value         TEXT NOT NULL,
+  reason              TEXT NOT NULL,
+  regulation_trigger  TEXT NOT NULL,
+  severity            TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+  created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX spec_diffs_versions_idx ON spec_diffs (from_version_id, to_version_id);
+CREATE INDEX spec_diffs_module_idx ON spec_diffs (module);
+
+-- ── GitHub Connections (per workspace) ────────────────────────
+CREATE TABLE IF NOT EXISTS github_connections (
+  id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  workspace_id            UUID NOT NULL UNIQUE REFERENCES workspaces(id) ON DELETE CASCADE,
+  github_installation_id  TEXT NOT NULL,
+  github_app_slug         TEXT NOT NULL,
+  repo_owner              TEXT NOT NULL,
+  repo_name               TEXT NOT NULL,
+  default_branch          TEXT NOT NULL DEFAULT 'main',
+  connected_by            UUID REFERENCES auth.users(id),
+  connected_at            TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE github_connections ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "github_workspace_isolation" ON github_connections
+  FOR ALL USING (
+    workspace_id IN (
+      SELECT id FROM workspaces WHERE owner_id = auth.uid()
+    )
+  );
+
+-- ── Regulation Impact Log ────────────────────────────────────────
+-- Records which specs were impacted by each regulation update
+CREATE TABLE IF NOT EXISTS regulation_impact_log (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  regulation_id       UUID NOT NULL,
+  regulation_ref      TEXT NOT NULL,    -- "GDPR Article 32"
+  workspace_id        UUID NOT NULL REFERENCES workspaces(id),
+  spec_version_id     UUID NOT NULL REFERENCES spec_versions(id),
+  new_spec_version_id UUID REFERENCES spec_versions(id),
+  affected_modules    TEXT[] NOT NULL,
+  diff_count          INTEGER NOT NULL DEFAULT 0,
+  status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'patched', 'pr_created', 'failed')),
+  github_pr_url       TEXT,
+  created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX impact_log_regulation_idx ON regulation_impact_log (regulation_id);
+CREATE INDEX impact_log_workspace_idx ON regulation_impact_log (workspace_id);
+
+-- ── RPCs ─────────────────────────────────────────────────────────
+
+-- Get the full version history chain for a spec
+CREATE OR REPLACE FUNCTION get_spec_version_chain(leaf_spec_id UUID)
+RETURNS TABLE (
+  id UUID,
+  parent_id UUID,
+  version_number INTEGER,
+  version_label TEXT,
+  status TEXT,
+  change_reason TEXT,
+  triggered_by TEXT,
+  regulation_trigger TEXT,
+  created_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY
+  WITH RECURSIVE chain AS (
+    SELECT s.id, s.parent_id, s.version_number, s.version_label,
+           s.status, s.change_reason, s.triggered_by, s.regulation_trigger, s.created_at
+    FROM spec_versions s WHERE s.id = leaf_spec_id
+    UNION ALL
+    SELECT s.id, s.parent_id, s.version_number, s.version_label,
+           s.status, s.change_reason, s.triggered_by, s.regulation_trigger, s.created_at
+    FROM spec_versions s
+    INNER JOIN chain c ON s.id = c.parent_id
+  )
+  SELECT * FROM chain ORDER BY version_number ASC;
+END;
+$$;
+
+-- Find all active specs in workspaces that use a given framework/jurisdiction
+CREATE OR REPLACE FUNCTION find_affected_specs(
+  p_framework TEXT,
+  p_jurisdiction TEXT
+)
+RETURNS TABLE (
+  spec_id UUID,
+  workspace_id UUID,
+  version_number INTEGER,
+  frameworks TEXT[],
+  jurisdictions TEXT[]
+)
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY
+  SELECT sv.id, sv.workspace_id, sv.version_number, sv.frameworks, sv.jurisdictions
+  FROM spec_versions sv
+  WHERE sv.status = 'active'
+    AND p_framework = ANY(sv.frameworks)
+    AND p_jurisdiction = ANY(sv.jurisdictions);
+END;
+$$;
+
+-- Auto-mark old version as superseded when a new one is created
+CREATE OR REPLACE FUNCTION supersede_parent_spec()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.parent_id IS NOT NULL THEN
+    UPDATE spec_versions
+    SET status = 'superseded', updated_at = NOW()
+    WHERE id = NEW.parent_id AND status = 'active';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER on_spec_version_insert
+  AFTER INSERT ON spec_versions
+  FOR EACH ROW EXECUTE FUNCTION supersede_parent_spec();
+
+-- Auto-update updated_at
+CREATE TRIGGER spec_versions_updated_at
+  BEFORE UPDATE ON spec_versions
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at();
